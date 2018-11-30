@@ -7,7 +7,7 @@ LINT_DEADLINE = 5s
 PROGRAM = kubesat
 VERSION = $(shell git describe --match [0-9]*)
 
-BUILD_FLAGS := -ldflags "-X main.Version=$(VERSION) -X main.Program=$(PROGRAM)"
+BUILD_FLAGS := -ldflags "-X main.Version=$(VERSION) -X main.Program=$(PROGRAM)" -race
 
 default : build test
 
