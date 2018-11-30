@@ -71,6 +71,21 @@ type PodCounts struct {
 	WithError int
 }
 
+type PodsOnNodeElement struct {
+	Name   string
+	Status string
+}
+
+type PodsOnNode []PodsOnNodeElement
+
+type PodsOnNodeListener struct {
+	// the channel to which to send PodsOnNode updates
+	Channel chan<- PodsOnNode
+
+	// the name of the node of interest
+	NodeName string
+}
+
 type DB struct {
 	logger    *logger.Logger
 	clientset *kubernetes.Clientset
@@ -85,6 +100,10 @@ type DB struct {
 	awsData        AwsData
 
 	nodeRequest chan chan<- []v1.Node
+
+	podsOnNodeListeners          map[chan<- PodsOnNode]PodsOnNodeListener
+	registerPodsOnNodeListener   chan PodsOnNodeListener
+	deregisterPodsOnNodeListener chan chan<- PodsOnNode
 }
 
 func NewDB(logger *logger.Logger, clientset *kubernetes.Clientset, ec2client *ec2.EC2) *DB {
@@ -103,6 +122,10 @@ func NewDB(logger *logger.Logger, clientset *kubernetes.Clientset, ec2client *ec
 		awsData:        AwsData{},
 
 		nodeRequest: make(chan chan<- []v1.Node),
+
+		podsOnNodeListeners:          make(map[chan<- PodsOnNode]PodsOnNodeListener),
+		registerPodsOnNodeListener:   make(chan PodsOnNodeListener),
+		deregisterPodsOnNodeListener: make(chan chan<- PodsOnNode),
 	}
 
 	go db.serve(snapshots)
@@ -260,11 +283,29 @@ func (db *DB) serve(snapshots chan<- Snapshot) {
 			}
 
 			snapshots <- Join(db.kubernetesData, db.awsData)
+
+			for _, listener := range db.podsOnNodeListeners {
+				podsOnNode := make([]PodsOnNodeElement, 0)
+				for _, pod := range db.kubernetesData.Pods {
+					if pod.Spec.NodeName != listener.NodeName {
+						continue
+					}
+					podsOnNode = append(podsOnNode, PodsOnNodeElement{
+						Name:   pod.Name,
+						Status: fmt.Sprintf("%v", pod.Status.Phase),
+					})
+				}
+				listener.Channel <- podsOnNode
+			}
 		case data := <-db.aws:
 			db.awsData = data
 			snapshots <- Join(db.kubernetesData, db.awsData)
 		case replyChan := <-db.nodeRequest:
 			replyChan <- db.kubernetesData.Nodes
+		case listener := <-db.registerPodsOnNodeListener:
+			db.podsOnNodeListeners[listener.Channel] = listener
+		case channel := <-db.deregisterPodsOnNodeListener:
+			delete(db.podsOnNodeListeners, channel)
 		}
 	}
 }
@@ -282,6 +323,17 @@ func (db *DB) Nodes() ([]v1.Node, bool) {
 	db.nodeRequest <- reply
 	nodes, ok := <-reply
 	return nodes, ok
+}
+
+func (db *DB) RegisterPodsOnNodeListener(channel chan<- PodsOnNode, name string) {
+	db.registerPodsOnNodeListener <- PodsOnNodeListener{
+		Channel:  channel,
+		NodeName: name,
+	}
+}
+
+func (db *DB) DeregisterPodsOnNodeListener(channel chan<- PodsOnNode) {
+	db.deregisterPodsOnNodeListener <- channel
 }
 
 func Join(kubernetesData KubernetesData, awsData AwsData) Snapshot {

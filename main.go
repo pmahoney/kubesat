@@ -73,6 +73,11 @@ type State struct {
 
 	Clientset *kubernetes.Clientset
 	EC2       *ec2.EC2
+
+	DB db.DB
+
+	PodsOnNode        db.PodsOnNode
+	PodsOnNodeChannel chan db.PodsOnNode
 }
 
 func (s *State) SelectMove(inc int) {
@@ -83,6 +88,10 @@ func (s *State) SelectMove(inc int) {
 	}
 	if index >= 0 && index < len(s.Snapshot.NodeTable.Rows) {
 		s.Selected = s.Snapshot.NodeTable.Rows[index].AwsID
+		go func() {
+			s.DB.DeregisterPodsOnNodeListener(s.PodsOnNodeChannel)
+			s.DB.RegisterPodsOnNodeListener(s.PodsOnNodeChannel, s.Snapshot.NodeTable.Rows[index].Name)
+		}()
 	}
 }
 
@@ -236,6 +245,12 @@ func Update(state *State, buf kit.BufferSlice) {
 
 	grid.Items["main"] = &table
 
+	if state.PodsOnNode != nil {
+		grid.Items["podsOnNode"] = kit.Line{
+			kit.String(fmt.Sprintf("%s: %s", state.PodsOnNode[0].Name, state.PodsOnNode[0].Status)),
+		}
+	}
+
 	{
 		len := state.Logger.Len()
 		rows := make([]kit.TableRow, 0, len)
@@ -319,7 +334,7 @@ func main() {
 		}
 	}()
 
-	db := db.NewDB(logger, clientset, ec2client)
+	data := db.NewDB(logger, clientset, ec2client)
 
 	areas := make(map[string]kit.Area)
 	areas["topline"] = kit.AreaAt(0, 0).Span(1, 1).WidthFr(1).HeightCh(1)
@@ -327,8 +342,9 @@ func main() {
 	areas["nodecount"] = kit.AreaAt(0, 2).Span(1, 1).WidthFr(1).HeightCh(1)
 	areas["component"] = kit.AreaAt(0, 3).Span(1, 1).WidthFr(1).HeightCh(1)
 	areas["main"] = kit.AreaAt(0, 4).Span(1, 1).WidthFr(1).HeightFr(3)
-	areas["procs"] = kit.AreaAt(0, 5).Span(1, 1).WidthFr(1).HeightFr(1)
-	areas["log"] = kit.AreaAt(0, 6).Span(1, 1).WidthFr(1).HeightCh(loggerCapacity)
+	areas["podsOnNode"] = kit.AreaAt(0, 5).Span(1, 1).WidthFr(1).HeightFr(1)
+	areas["procs"] = kit.AreaAt(0, 6).Span(1, 1).WidthFr(1).HeightFr(1)
+	areas["log"] = kit.AreaAt(0, 7).Span(1, 1).WidthFr(1).HeightCh(loggerCapacity)
 	grid := kit.NewGrid(areas)
 
 	state := &State{
@@ -337,6 +353,8 @@ func main() {
 		Procs:     make([]proc.Proc, 0),
 		Clientset: clientset,
 		EC2:       ec2client,
+
+		PodsOnNodeChannel: make(chan db.PodsOnNode),
 	}
 
 	if err := func() error {
@@ -384,11 +402,13 @@ func main() {
 				logger.Warnf("termbox: %v", err)
 			case <-termboxEvents.Interrupts:
 				return nil
-			case snapshot := <-db.Snapshots:
+			case snapshot := <-data.Snapshots:
 				state.Snapshot = snapshot
 				if state.Selected == "" && len(snapshot.NodeTable.Rows) > 0 {
 					state.Selected = snapshot.NodeTable.Rows[0].AwsID
 				}
+			case podsOnNode := <-state.PodsOnNodeChannel:
+				state.PodsOnNode = podsOnNode
 			case <-loggerUpdated:
 				// update ui
 			}
